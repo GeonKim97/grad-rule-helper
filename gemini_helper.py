@@ -16,11 +16,12 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# 우선 사용할 Gemini 모델 목록 (가장 빠르고 문서 이해력이 좋은 Flash 계열)
+# 우선 사용할 최신 Gemini 모델 목록 (가장 빠르고 안정적인 모델 우선, 혼잡 시 즉시 전환)
 PREFERRED_MODELS: List[str] = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
 ]
 
 PLACEHOLDER_KEYS = {
@@ -87,9 +88,19 @@ def _friendly_error_message(exc: Exception) -> str:
             "잠시 인터넷 연결이 원활하지 않아요. "
             "네트워크 연결 상태를 확인하신 뒤 다시 시도해 주세요."
         )
+    if any(k in raw for k in ["503", "unavailable", "overloaded", "high demand", "500"]):
+        return (
+            "잠시 AI 서버에 사용자가 몰려 응답이 지연되고 있어요. "
+            "몇 초 뒤에 다시 [답변 검색] 버튼을 눌러 주세요."
+        )
+    if any(k in raw for k in ["not found", "404", "no longer available"]):
+        return (
+            "현재 설정된 AI 모델 버전을 찾을 수 없어요. "
+            "잠시 후 다시 시도하시거나 관리자에게 모델 버전 업데이트를 요청해 주세요."
+        )
     return (
-        "잠시 연결이 원활하지 않아요. `.env` 파일의 API 키나 인터넷 연결을 확인해 주세요. "
-        "(문제가 계속되면 잠시 후 다시 시도해 주세요.)"
+        "잠시 연결이 원활하지 않아요. `.env` 파일(또는 Vercel 환경변수)의 API 키나 "
+        "인터넷 연결을 확인해 주세요. (문제가 계속되면 잠시 후 다시 시도해 주세요.)"
     )
 
 
@@ -188,10 +199,23 @@ def ask_regulation_qa(
 {regulation_context}
 """.strip()
 
-    client = genai.Client(api_key=api_key)
+    # Vercel 등 웹 서버에서 응답이 오래 지연되지 않도록 요청당 20초 제한 및 빠른 모델 전환 설정
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=20000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
     last_error: Exception | None = None
 
-    for model_name in PREFERRED_MODELS:
+    candidate_models = list(PREFERRED_MODELS)
+    discovered_extra = False
+
+    idx = 0
+    while idx < len(candidate_models):
+        model_name = candidate_models[idx]
+        idx += 1
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -237,8 +261,38 @@ def ask_regulation_qa(
         except Exception as exc:
             last_error = exc
             err_lower = str(exc).lower()
-            # 모델 이름 미지원(404/not found)일 때만 다음 예비 모델로 자동 전환
-            if "not found" in err_lower or "404" in err_lower or "unsupported" in err_lower:
+            # 모델 미지원(404) 또는 일시적 혼잡(503/500/overloaded) 시 다음 예비 모델로 자동 전환
+            is_retryable_model_err = any(
+                k in err_lower
+                for k in [
+                    "not found",
+                    "404",
+                    "unsupported",
+                    "503",
+                    "unavailable",
+                    "overloaded",
+                    "high demand",
+                    "500",
+                ]
+            )
+            if is_retryable_model_err:
+                # 미리 적은 모델이 모두 실패하면 사용 가능한 최신 Flash 모델을 자동 탐색
+                if idx >= len(candidate_models) and not discovered_extra:
+                    discovered_extra = True
+                    try:
+                        for m in reversed(list(client.models.list())):
+                            name = (getattr(m, "name", "") or "").replace("models/", "")
+                            lower_name = name.lower()
+                            if (
+                                "flash" in lower_name
+                                and "image" not in lower_name
+                                and "omni" not in lower_name
+                                and name not in candidate_models
+                            ):
+                                candidate_models.append(name)
+                                break
+                    except Exception:
+                        pass
                 continue
             return QAResponse(ok=False, error_message=_friendly_error_message(exc))
 

@@ -315,13 +315,13 @@ def build_context_for_school(
             # 일치하는 쪽이 너무 적으면 앞/뒤 요약 쪽 포함
             if not selected_pages:
                 selected_pages = sec.pages[:3]
-            # 대학원당 최대 5쪽 이내로 정리하여 응답 속도 확보
-            if len(selected_pages) > 5:
+            # 대학원당 최대 3쪽 이내로 정리하여 Vercel에서도 빠른 응답 속도 확보
+            if len(selected_pages) > 3:
                 scored = sorted(
                     selected_pages,
                     key=lambda item: sum(item[1].count(kw) for kw in keywords) + (2 if "부칙" in item[1] else 0),
                     reverse=True,
-                )[:5]
+                )[:3]
                 scored.sort(key=lambda item: item[0])
                 selected_pages = scored
 
@@ -343,18 +343,22 @@ def build_context_for_school(
 
         return "\n\n".join(parts), chosen
 
-    # 단일 대학원 선택
+    # 단일 대학원 선택: 대학원 학칙 + 해당 대학원 시행세칙 전체 + 질문 관련 부속 규정
     if selected_school in sections:
         chosen.append(sections[selected_school])
 
-    for common_key in [
-        "장학금 지급규정",
-        "학·석사 연계과정 운영 규정",
-        "석·박사 통합과정 운영 규정",
-        "기타 공통 규정",
-    ]:
-        if common_key in sections:
+    q_lower = question.lower()
+    conditional_commons = [
+        ("장학금 지급규정", ["장학", "감면", "등록금", "성적", "평점"]),
+        ("학·석사 연계과정 운영 규정", ["연계", "학석사", "학·석사", "조기"]),
+        ("석·박사 통합과정 운영 규정", ["통합", "석박사", "석·박사", "전환"]),
+    ]
+    for common_key, triggers in conditional_commons:
+        if common_key in sections and (not q_lower or any(t in q_lower for t in triggers)):
             chosen.append(sections[common_key])
+
+    if "기타 공통 규정" in sections:
+        chosen.append(sections["기타 공통 규정"])
 
     parts = [
         f"====================\n[규정 구분: {sec.title}]\n====================\n{sec.full_text}"
