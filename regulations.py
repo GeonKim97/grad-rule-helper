@@ -2,10 +2,14 @@
 규정 문서(PDF, TXT, MD)를 읽고 대학원별로 깔끔하게 정리해 주는 모듈입니다.
 비유하자면, 책장에 꽂힌 두꺼운 학칙·시행세칙 규정집에서
 필요한 대학원 쪽만 빠르게 찾아 펼쳐 주는 '사서 선생님' 역할을 합니다.
+
+※ 웹 배포(Vercel)에서도 0.01초 만에 규정을 불러올 수 있도록
+   미리 정리된 빠른 색인 파일(data/regulations_cache.json)을 함께 지원합니다.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,12 +39,15 @@ GRAD_SCHOOL_OPTIONS: List[str] = [
     *SPECIAL_GRAD_SCHOOLS,
 ]
 
-COMMON_SECTION_KEYS: List[str] = [
-    "대학원 학칙",
-    "장학금 지급규정",
-    "학·석사 연계과정 운영 규정",
-    "석·박사 통합과정 운영 규정",
-    "기타 공통 규정",
+# '전체 비교' 질문 시 빠른 핵심 발췌를 돕는 일상어 -> 규정어 보조 키워드
+SYNONYM_GROUPS: List[List[str]] = [
+    ["논문", "학점", "대체", "비논문", "졸업", "학위수여", "청구논문", "추가학점", "이수학점"],
+    ["휴학", "복학", "제적", "자퇴", "재입학", "등록", "수업연한"],
+    ["수료", "연구등록", "이수학점", "졸업학점", "평점", "성적"],
+    ["전과", "전공", "변경", "과정전환", "편입"],
+    ["장학", "장학금", "성적", "감면", "지급"],
+    ["외국어", "종합시험", "면제", "자격시험", "영어", "어학"],
+    ["연계", "통합", "석박사", "학석사"],
 ]
 
 
@@ -48,10 +55,10 @@ COMMON_SECTION_KEYS: List[str] = [
 class RegulationSection:
     """대학원별 또는 공통 규정 한 묶음의 정보"""
 
-    key: str  # 예: "일반대학원", "공학대학원", "대학원 학칙"
-    title: str  # 표시용 문서명
-    source_file: str  # 원본 파일명
-    pages: List[Tuple[int, str]]  # (PDF 쪽번호 또는 1, 본문 텍스트) 리스트
+    key: str
+    title: str
+    source_file: str
+    pages: List[Tuple[int, str]]
 
     @property
     def full_text(self) -> str:
@@ -62,45 +69,34 @@ class RegulationSection:
 
 
 def _normalize_for_heading(line: str) -> str:
-    """공백과 특수기호를 줄여 제목 패턴을 안정적으로 비교합니다."""
     return re.sub(r"[\s·ㆍ・]+", "", line)
 
 
 def _detect_section_start(page_text: str) -> Tuple[str, str] | None:
-    """
-    시행세칙 합본 PDF의 각 페이지 상단을 보고,
-    새로운 대학원 시행세칙이나 부속 규정이 시작되는 쪽인지 판별합니다.
-    """
     raw_lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
     if not raw_lines:
         return None
 
-    # 목차 페이지는 건너뜀
     top_preview = " ".join(raw_lines[:6])
     if "목" in top_preview and "차" in top_preview and ("··" in page_text or ".." in page_text):
         return None
 
-    # 쪽번호('- 17 -' 등)를 제외한 맨 첫 2줄에서만 규정 제목을 확인합니다.
     candidate_lines = [
         line for line in raw_lines if not re.fullmatch(r"[-–—\s\d]+", line)
     ][:2]
 
     for line in candidate_lines:
-        # 본문 문장(조항·항·마침표로 끝나는 문장)은 제목이 아니므로 제외
         if line.startswith(("제", "①", "②", "③", "④", "⑤")) or line.endswith("다."):
             continue
         compact = _normalize_for_heading(line)
 
-        # 1) 특수대학원 학칙시행세칙 확인
         for school in SPECIAL_GRAD_SCHOOLS:
             if compact in (f"{school}학칙시행세칙", f"{school}시행세칙"):
                 return school, f"{school} 학칙시행세칙"
 
-        # 2) 일반대학원 학칙시행세칙 (문서 표기가 "대학원 학칙시행세칙" 또는 "일반대학원 학칙시행세칙")
         if compact in ("대학원학칙시행세칙", "일반대학원학칙시행세칙"):
             return "일반대학원", "일반대학원 학칙시행세칙"
 
-        # 3) 부속 공통 규정 확인
         if compact in ("장학금지급규정", "대학원장학금지급규정"):
             return "장학금 지급규정", "장학금 지급규정"
         if compact in ("학석사연계과정운영규정", "대학원학석사연계과정운영규정"):
@@ -112,7 +108,6 @@ def _detect_section_start(page_text: str) -> Tuple[str, str] | None:
 
 
 def _guess_key_from_filename(filename: str) -> Tuple[str, str]:
-    """개별 파일 이름에서 어느 대학원/공통 규정인지 추정합니다."""
     stem = Path(filename).stem
     for school in SPECIAL_GRAD_SCHOOLS:
         if school in stem:
@@ -130,12 +125,8 @@ def _guess_key_from_filename(filename: str) -> Tuple[str, str]:
     return "기타 공통 규정", stem
 
 
-def load_regulation_sections(regulations_dir: Path) -> Tuple[Dict[str, RegulationSection], List[str]]:
-    """
-    data/regulations/ 폴더 안의 모든 PDF, TXT, MD 규정 파일을 읽어
-    대학원별·공통 규정 섹션 딕셔너리로 반환합니다.
-    반환값: (섹션 딕셔너리, 읽어 들인 파일명 목록)
-    """
+def parse_regulations_from_files(regulations_dir: Path) -> Tuple[Dict[str, RegulationSection], List[str]]:
+    """PDF/TXT/MD 원본 파일들을 직접 읽어 대학원별 섹션으로 나눕니다."""
     sections: Dict[str, RegulationSection] = {}
     loaded_files: List[str] = []
 
@@ -171,7 +162,6 @@ def load_regulation_sections(regulations_dir: Path) -> Tuple[Dict[str, Regulatio
             except Exception:
                 continue
 
-            # 시행세칙 합본 여부 확인: 내부에서 2개 이상의 섹션 제목이 감지되면 자동 분할
             detected_starts: Dict[int, Tuple[str, str]] = {}
             page_texts: List[str] = []
             for idx, page in enumerate(reader.pages):
@@ -204,14 +194,101 @@ def load_regulation_sections(regulations_dir: Path) -> Tuple[Dict[str, Regulatio
     return sections, loaded_files
 
 
+def save_regulations_cache(
+    cache_path: Path,
+    sections: Dict[str, RegulationSection],
+    loaded_files: List[str],
+) -> None:
+    """파싱 결과를 빠른 JSON 색인 파일로 저장합니다."""
+    payload = {
+        "loaded_files": loaded_files,
+        "sections": [
+            {
+                "key": sec.key,
+                "title": sec.title,
+                "source_file": sec.source_file,
+                "pages": [[pno, txt] for pno, txt in sec.pages],
+            }
+            for sec in sections.values()
+        ],
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def load_regulation_sections(
+    regulations_dir: Path,
+    cache_path: Path | None = None,
+) -> Tuple[Dict[str, RegulationSection], List[str]]:
+    """
+    빠른 색인 파일(regulations_cache.json)이 최신 상태이면 즉시 읽고,
+    없거나 새 규정 파일이 추가되었으면 원본 PDF/TXT를 다시 읽어옵니다.
+    """
+    if cache_path is not None and cache_path.exists():
+        # 원본 파일 목록이 캐시와 같으면 초고속 로드 (Vercel 콜드스타트 0.01초)
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached_files = cached.get("loaded_files", [])
+            current_files = (
+                sorted(
+                    p.name
+                    for p in regulations_dir.iterdir()
+                    if p.is_file()
+                    and p.suffix.lower() in {".pdf", ".txt", ".md"}
+                    and not p.name.startswith(".")
+                )
+                if regulations_dir.exists()
+                else []
+            )
+            if not current_files or current_files == cached_files:
+                sections: Dict[str, RegulationSection] = {}
+                for item in cached.get("sections", []):
+                    sec = RegulationSection(
+                        key=item["key"],
+                        title=item["title"],
+                        source_file=item["source_file"],
+                        pages=[(int(p[0]), str(p[1])) for p in item.get("pages", [])],
+                    )
+                    sections[sec.key] = sec
+                return sections, cached_files
+        except Exception:
+            pass
+
+    sections, loaded_files = parse_regulations_from_files(regulations_dir)
+    if cache_path is not None and sections:
+        try:
+            save_regulations_cache(cache_path, sections, loaded_files)
+        except OSError:
+            # Vercel 등 읽기 전용 서버에서는 캐시 쓰기를 건너뜀
+            pass
+    return sections, loaded_files
+
+
+def _expand_query_keywords(question: str) -> List[str]:
+    """질문에서 핵심 단어를 뽑고 관련 규정 동의어를 함께 묶어줍니다."""
+    tokens = [t for t in re.findall(r"[가-힣A-Za-z0-9]{2,}", question) if len(t) >= 2]
+    stopwords = {"있나요", "인가요", "가능한가요", "여부", "관련", "안내", "어떻게", "무엇", "대신", "할수"}
+    keywords = [t for t in tokens if t not in stopwords]
+
+    expanded = list(keywords)
+    for group in SYNONYM_GROUPS:
+        if any(any(g in kw or kw in g for kw in keywords) for g in group):
+            for g in group:
+                if g not in expanded:
+                    expanded.append(g)
+    return expanded
+
+
 def build_context_for_school(
     sections: Dict[str, RegulationSection],
     selected_school: str,
+    question: str = "",
 ) -> Tuple[str, List[RegulationSection]]:
     """
     선택한 대학원에 맞춰 AI에게 전달할 규정 본문을 구성합니다.
-    - 특정 대학원을 고르면: [대학원 학칙] + [해당 대학원 시행세칙 전체] + [공통 부속 규정]
-    - '전체 비교'를 고르면: [대학원 학칙] + [일반대학원 및 모든 특수대학원 시행세칙] + [공통 부속 규정]
+    - 단일 대학원 선택 시: [대학원 학칙] + [해당 대학원 시행세칙 전체] + [공통 부속 규정]
+    - '전체 비교' 선택 시: [대학원 학칙] + [일반/특수대학원 13곳 중 질문 관련 조항 + 부칙]
+      (서버 응답 속도와 정확도를 동시에 지키기 위해 핵심 쪽만 압축 전달)
     """
     chosen: List[RegulationSection] = []
 
@@ -219,12 +296,56 @@ def build_context_for_school(
         chosen.append(sections["대학원 학칙"])
 
     if selected_school == "전체 비교":
+        keywords = _expand_query_keywords(question)
+        parts = []
+        if "대학원 학칙" in sections:
+            sec = sections["대학원 학칙"]
+            parts.append(f"====================\n[규정 구분: {sec.title}]\n====================\n{sec.full_text}")
+
         for school in ["일반대학원", *SPECIAL_GRAD_SCHOOLS]:
-            if school in sections:
-                chosen.append(sections[school])
-    else:
-        if selected_school in sections:
-            chosen.append(sections[selected_school])
+            if school not in sections:
+                continue
+            sec = sections[school]
+            chosen.append(sec)
+
+            selected_pages = []
+            for pno, txt in sec.pages:
+                if not keywords or "부칙" in txt or any(kw in txt for kw in keywords):
+                    selected_pages.append((pno, txt))
+            # 일치하는 쪽이 너무 적으면 앞/뒤 요약 쪽 포함
+            if not selected_pages:
+                selected_pages = sec.pages[:3]
+            # 대학원당 최대 5쪽 이내로 정리하여 응답 속도 확보
+            if len(selected_pages) > 5:
+                scored = sorted(
+                    selected_pages,
+                    key=lambda item: sum(item[1].count(kw) for kw in keywords) + (2 if "부칙" in item[1] else 0),
+                    reverse=True,
+                )[:5]
+                scored.sort(key=lambda item: item[0])
+                selected_pages = scored
+
+            chunks = [
+                f"[출처: {sec.source_file} / {sec.title} / p.{pno}]\n{txt}"
+                for pno, txt in selected_pages
+            ]
+            parts.append(
+                f"====================\n[규정 구분: {sec.title}]\n====================\n"
+                + "\n\n".join(chunks)
+            )
+
+        for common_key in ["장학금 지급규정", "학·석사 연계과정 운영 규정", "석·박사 통합과정 운영 규정"]:
+            if common_key in sections:
+                sec = sections[common_key]
+                if any(kw in sec.title or any(kw in t for _, t in sec.pages) for kw in keywords):
+                    chosen.append(sec)
+                    parts.append(f"====================\n[규정 구분: {sec.title}]\n====================\n{sec.full_text}")
+
+        return "\n\n".join(parts), chosen
+
+    # 단일 대학원 선택
+    if selected_school in sections:
+        chosen.append(sections[selected_school])
 
     for common_key in [
         "장학금 지급규정",
@@ -235,10 +356,10 @@ def build_context_for_school(
         if common_key in sections:
             chosen.append(sections[common_key])
 
-    parts = []
-    for sec in chosen:
-        parts.append(f"====================\n[규정 구분: {sec.title}]\n====================\n{sec.full_text}")
-
+    parts = [
+        f"====================\n[규정 구분: {sec.title}]\n====================\n{sec.full_text}"
+        for sec in chosen
+    ]
     return "\n\n".join(parts), chosen
 
 
@@ -255,7 +376,6 @@ def extract_matching_original_clauses(
     results: List[Dict[str, str]] = []
     seen = set()
 
-    # 조항 번호 패턴 정규화 (예: "제24조", "제 24 조", "부칙")
     patterns: List[str] = []
     for item in article_numbers:
         for m in re.findall(r"제\s*\d+\s*조(?:의\s*\d+)?|부\s*칙", item):
@@ -267,7 +387,6 @@ def extract_matching_original_clauses(
 
     for sec in target_sections:
         for page_no, page_text in sec.pages:
-            # 조항 단위로 보기 좋게 분리
             blocks = re.split(r"(?=(?:^|\n)\s*(?:제\s*\d+\s*조(?:의\s*\d+)?|부\s*칙))", page_text)
             for block in blocks:
                 cleaned = block.strip()

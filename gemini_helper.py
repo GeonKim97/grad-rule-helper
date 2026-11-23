@@ -125,8 +125,8 @@ def ask_regulation_qa(
         return QAResponse(
             ok=False,
             error_message=(
-                "잠시 연결이 원활하지 않아요. 작업 폴더 안의 `.env` 파일에 "
-                "GEMINI_API_KEY가 올바르게 저장되어 있는지 확인해 주세요."
+                "잠시 연결이 원활하지 않아요. `.env` 파일(또는 Vercel의 Environment Variables)에 "
+                "GEMINI_API_KEY가 올바르게 입력되어 있는지 확인해 주세요."
             ),
         )
 
